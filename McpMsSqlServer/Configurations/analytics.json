@@ -1,7 +1,7 @@
 {
   "name": "Data Analytics Dashboard",
   "connectionString": "Server=analytics-srv;Database=DataWarehouse;User Id=analyst;Password=secure_pwd;TrustServerCertificate=true;",
-  "allowedSchema": "reporting",
+  "allowedSchemas": ["reporting"],
   "permissions": {
     "allowRead": true,
     "allowWrite": false,

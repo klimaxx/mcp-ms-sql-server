@@ -101,7 +101,7 @@ public class ConfigService
         return JsonSerializer.Serialize(new
         {
             Name = config.Name,
-            Schema = config.AllowedSchema,
+            AllowedSchemas = config.AllowedSchemas,
             Permissions = config.Permissions,
             Security = new
             {
@@ -120,7 +120,7 @@ public class ConfigService
         {
             Name = "Default Configuration",
             ConnectionString = "Server=localhost;Database=TestDB;Integrated Security=true;",
-            AllowedSchema = "dbo",
+            AllowedSchemas = new List<string> { "dbo" },
             Permissions = new PermissionSettings
             {
                 AllowRead = true,

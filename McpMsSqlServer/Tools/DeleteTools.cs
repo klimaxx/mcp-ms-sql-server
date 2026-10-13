@@ -11,9 +11,10 @@ namespace McpMsSqlServer.Tools;
 public static class DeleteTools
 {
     [McpServerTool]
-    [Description("Delete records from a table within the configured schema")]
+    [Description("Delete records from a table in one of the allowed schemas")]
     public static async Task<string> DeleteRecords(
-        [Description("The table name to delete from")] string tableName,
+        [Description("The table name to delete from (may be schema-qualified, e.g. Trading.Orders)")] string tableName,
+        [Description("Schema containing the table; must be one of the allowed schemas (default: first allowed schema)")] string? schemaName,
         [Description("WHERE clause conditions (required for safety)")] string whereClause,
         [Description("Whether to use a transaction (default: true)")] bool useTransaction,
         DatabaseService databaseService,
@@ -35,7 +36,13 @@ public static class DeleteTools
                 return JsonSerializer.Serialize(new { error = "WHERE clause is required for DELETE operations to prevent accidental mass deletion" });
             }
 
-            var schemaName = config.AllowedSchema;
+            var resolved = securityService.ResolveSchema(schemaName, tableName);
+            if (!resolved.IsValid)
+            {
+                return JsonSerializer.Serialize(new { error = resolved.Error });
+            }
+            schemaName = resolved.Schema;
+            tableName = resolved.Table;
 
             // Validate table access
             var validationResult = await securityService.ValidateTableAccessAsync(schemaName, tableName);

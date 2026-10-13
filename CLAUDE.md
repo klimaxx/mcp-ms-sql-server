@@ -1,149 +1,39 @@
-# MCP SQL Server Project
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Overview
-This project implements a Model Context Protocol (MCP) server in C# that provides secure access to MS SQL databases through Claude Code. The server supports multiple project configurations with granular permissions and comprehensive database operations.
+A C# (.NET 9) Model Context Protocol server that gives MCP clients (Claude Code / Claude Desktop) controlled access to Microsoft SQL Server over STDIO. Behavior is driven by per-project JSON configurations that set the connection string, allowed schemas, permissions and safety limits.
 
-## Project Structure
-```
-McpMsSqlServer/
-├── Program.cs              # Entry point and MCP server setup
-├── Tools/                  # MCP tool implementations
-│   ├── QueryTools.cs       # Execute SELECT queries
-│   ├── InsertTools.cs      # Insert new records
-│   ├── UpdateTools.cs      # Update existing records
-│   ├── DeleteTools.cs      # Delete records
-│   ├── SchemaTools.cs      # Database schema inspection
-│   ├── TableInfoTools.cs   # Table metadata and structure
-│   ├── ConfigurationTools.cs # Manage configurations
-│   ├── ConnectionTools.cs  # Test database connectivity
-│   ├── QueryBuilderTool.cs # Generate queries from natural language
-│   ├── PerformanceAnalysisTool.cs # Query performance analysis
-│   └── DataDiscoveryTool.cs # Data discovery and profiling
-├── Services/
-│   ├── DatabaseService.cs   # SQL connection and execution logic
-│   ├── SecurityService.cs   # Query validation and sanitization
-│   ├── ConfigService.cs     # Configuration management
-│   └── TransactionService.cs # Transaction management
-├── Models/
-│   └── DatabaseConfig.cs   # Database configuration models
-├── Configurations/         # Project-based configurations
-│   ├── default.json
-│   ├── project1.json
-│   └── analytics.json
-└── appsettings.json
-```
+The .NET project lives in the `McpMsSqlServer/` subfolder (the repo root only holds `README.md`, `mcp-sql-server-plan.md` and this file). Tests live in the sibling `McpMsSqlServer.Tests/` project (`dotnet test McpMsSqlServer.Tests` from the repo root). Integration tests create a throw-away database on `(localdb)\MSSQLLocalDB` and return early when LocalDB is unavailable.
 
-## Development Commands
-
-### Build and Run
+## Commands
+Run from `McpMsSqlServer/` (tests: see above):
 ```bash
-# Build the project
-dotnet build
-
-# Run the MCP server
-dotnet run --project McpMsSqlServer
-
-# Run with specific configuration
-MCP_CONFIG_NAME=project1 dotnet run --project McpMsSqlServer
-
-# Run tests
-dotnet test
-
-# Run with debug logging
-MCP_DEBUG=true dotnet run --project McpMsSqlServer
+dotnet build                          # Debug build
+dotnet build -c Release               # produces bin/Release/net9.0/McpMsSqlServer.exe (what MCP clients launch)
+dotnet run                            # speaks JSON-RPC on stdin/stdout
+MCP_CONFIG_NAME=project1 dotnet run   # start with a specific configuration
 ```
+Env vars actually read by the code: `MCP_CONFIG_NAME` (initial configuration) and `MCP_CONFIG_PATH` (override the `Configurations` directory). `MCP_DEBUG`, `--test-connection` and `${ENV_VAR}` substitution in connection strings are mentioned in docs but are **not implemented**.
 
-### Package Management
-```bash
-# Required packages (already added)
-# - ModelContextProtocol --version 0.1.0-preview.1.25171.12
-# - Microsoft.Data.SqlClient
-```
+## Architecture
+- `Program.cs` — Generic Host; registers the four services as singletons and calls `AddMcpServer().WithStdioServerTransport().WithToolsFromAssembly()`. Any `[McpServerToolType]` static class under `Tools/` is auto-discovered; adding a tool is just adding a `[McpServerTool]` method.
+- **stdout is the JSON-RPC channel.** Logging providers are cleared on purpose and nothing may write to stdout (`Console.WriteLine`, logging, debug prints). `ILogger` calls (including audit log in `TransactionService.LogOperationAsync`) are therefore effectively no-ops.
+- Tools (`Tools/*.cs`) are static classes; services are injected as extra method parameters (`DatabaseService`, `ConfigService`, `SecurityService`, `TransactionService`) after the `[Description]`-annotated MCP arguments. Tools return JSON strings and report failures as `{ "error": ... }` rather than throwing.
+- `ConfigService` — loads every `Configurations/*.json` at startup (case-insensitive property names). The **configuration name is the file name**, not the `name` field. Holds the "current" configuration as singleton in-memory state; `SwitchConfiguration` changes it for all subsequent tool calls and is not persisted. Unknown names silently fall back to the `"default"` key, so keep a `default.json`. The directory is resolved relative to the exe by walking up three levels out of `bin/<cfg>/net9.0`.
+- `SecurityService` — regex-based validation (dangerous patterns, restricted tables, WHERE presence) and schema/table access checks against `AllowedSchemas` and `RestrictedTables`. `ResolveSchema` (single table: `schemaName` arg, `schema.table`, or default) and `ResolveSchemas` (discovery tools: all allowed or one) are the entry points tools use; never read the schema straight from config.
+- `DatabaseService` / `TransactionService` — connection creation from the current configuration and a commit/rollback wrapper. Several write tools (e.g. `UpdateTools`) open their own connection and transaction instead of using `TransactionService`.
+- `Models/DatabaseConfig.cs` — configuration shape (`AllowedSchemas`, `Permissions`, `Security`, `QuerySettings`, `RestrictedTables`, `AllowedOperations`). `AllowedSchemas` is a list; the legacy JSON `allowedSchema` string is accepted and becomes a one-element list (list wins if both are present). `DefaultSchema` is the first entry; empty list = unrestricted.
 
-## Core MCP Tools
+### Permission enforcement is split across layers
+- Read/write/delete gating uses `Permissions.AllowRead/AllowWrite/AllowDelete`, checked inside each tool.
+- `AllowedOperations` is only consulted through `SecurityService.ValidateQuery` (currently called for `SELECT` from `ExecuteQuery`).
+- Row limits: `MaxRowsPerQuery` truncates results client-side while reading; `MaxRowsPerUpdate/Delete` are checked with a `COUNT(*)` pre-query inside the transaction.
+- Write tools interpolate `[schema].[table]` from config/user input and splice the caller's `whereClause` directly into SQL (values go through `SqlParameter`s). Preserve the identifier handling and `ValidateWhereClauseAsync` checks when touching these tools.
 
-### Total Implemented: 16 Tools
+## Configurations
+`Configurations/*.json` are committed to git and contain connection strings; keep real credentials out of anything you commit (e.g. `YMS-TIS-S10116-TIS-PROD.json` is currently untracked). `README.md` documents the full schema and example dev/prod configurations.
 
-### Phase 1 Tools (Configuration Management)
-1. **TestConnection** - Test database connectivity with current configuration
-2. **ListConfigurations** - List all available project configurations
-3. **SwitchConfiguration** - Switch to a different project configuration
-4. **GetCurrentConfiguration** - Get current configuration details
-
-### Phase 2 Tools (Core Database Operations)
-5. **ExecuteQuery** - Execute SELECT queries within configured schema
-6. **GetSchemaInfo** - Get database schema information
-7. **GetTableInfo** - Get detailed table metadata and sample data
-8. **InsertRecords** - Insert new records with transaction support
-9. **UpdateRecords** - Update existing records (requires WHERE clause)
-10. **DeleteRecords** - Delete records (requires WHERE clause)
-
-### Phase 3 Tools (Advanced Features)
-11. **BuildQuery** - Generate SQL queries from natural language descriptions
-12. **AnalyzeQueryPerformance** - Analyze query performance and provide optimization suggestions
-13. **GetDatabasePerformanceStats** - Get database performance statistics and recommendations
-14. **DiscoverData** - Search for tables/columns by name patterns and discover relationships
-15. **AnalyzeTableRelationships** - Find all relationships and dependencies for specified tables
-16. **ProfileDataQuality** - Profile data quality and statistics for specified tables
-
-## Security Features
-- Schema-based access control
-- Mandatory WHERE clauses for updates/deletes
-- Transaction management for write operations
-- Query validation and sanitization
-- Parameterized queries to prevent SQL injection
-- Per-project permission configuration
-- Audit logging for write operations
-
-## Configuration Structure
-Each project configuration includes:
-- Connection string
-- Allowed schema
-- Read/write/delete permissions
-- Security settings (max rows, audit logging)
-- Query settings (timeout, joins allowed)
-- Restricted tables list
-- Allowed operations
-
-## Implementation Status
-- [x] Phase 1: Basic MCP Server Setup ✅ COMPLETED
-  - [x] .NET console application created
-  - [x] MCP SDK (v0.2.0-preview.1) and SQL Client packages added
-  - [x] Project structure with folders
-  - [x] STDIO transport configured
-  - [x] Basic server initialization with hosting
-  - [x] Configuration service and models
-  - [x] Database connection service
-  - [x] Security and Transaction services
-  - [x] Connection testing tool
-  - [x] Configuration management tools (4 tools)
-  - [x] Sample configuration files
-  - [x] Successful build with all core services
-- [x] Phase 2: Core Database Tools ✅ COMPLETED
-  - [x] QueryTools - Execute SELECT queries
-  - [x] SchemaTools - Database schema inspection  
-  - [x] TableInfoTools - Table metadata and structure
-  - [x] InsertTools - Insert new records
-  - [x] UpdateTools - Update existing records
-  - [x] DeleteTools - Delete records
-- [x] Phase 3: Advanced Features ✅ COMPLETED
-  - [x] QueryBuilderTool - Natural language query generation
-  - [x] PerformanceAnalysisTool - Query performance analysis
-  - [x] DataDiscoveryTool - Data discovery and profiling
-- [ ] Phase 4: Claude Code Integration
-
-## Testing Strategy
-- Unit tests for all services
-- Integration tests for MCP communication
-- Security tests for SQL injection prevention
-- End-to-end tests with Claude Code
-
-## Known Issues
-None at this time - project is in initial setup phase.
-
-## Notes
-- Always use parameterized queries
-- Validate schema access before query execution
-- Log all write operations when audit is enabled
-- Use transactions for data consistency
-- Respect per-project permission settings
+## Package notes
+`ModelContextProtocol` 0.2.0-preview.1, `Microsoft.Data.SqlClient` 6.0.2, `Microsoft.Extensions.Hosting` 9.0.5. The MCP SDK is a preview; attribute/API names may change between versions.

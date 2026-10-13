@@ -47,7 +47,7 @@ public class DatabaseService
                 ServerVersion = connection.ServerVersion,
                 State = connection.State.ToString(),
                 ConfigName = _configService.CurrentConfig.Name,
-                Schema = _configService.CurrentConfig.AllowedSchema
+                AllowedSchemas = _configService.CurrentConfig.AllowedSchemas
             };
             
             return JsonSerializer.Serialize(info, new JsonSerializerOptions { WriteIndented = true });
@@ -129,7 +129,7 @@ public class DatabaseService
     
     public string GetSchemaPrefix()
     {
-        var schema = _configService.CurrentConfig.AllowedSchema;
+        var schema = _configService.CurrentConfig.DefaultSchema;
         return string.IsNullOrEmpty(schema) ? "" : $"[{schema}].";
     }
     

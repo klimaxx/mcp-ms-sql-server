@@ -13,7 +13,8 @@ public static class TableInfoTools
     [McpServerTool]
     [Description("Get detailed table metadata and sample data")]
     public static async Task<string> GetTableInfo(
-        [Description("The table name to inspect")] string tableName,
+        [Description("The table name to inspect (may be schema-qualified, e.g. Trading.Orders)")] string tableName,
+        [Description("Schema containing the table; must be one of the allowed schemas (default: first allowed schema)")] string? schemaName,
         [Description("Number of sample rows to return (default: 10)")] int sampleRows,
         DatabaseService databaseService,
         ConfigService configService,
@@ -22,7 +23,13 @@ public static class TableInfoTools
         try
         {
             var config = configService.CurrentConfig;
-            var schemaName = config.AllowedSchema;
+            var resolved = securityService.ResolveSchema(schemaName, tableName);
+            if (!resolved.IsValid)
+            {
+                return JsonSerializer.Serialize(new { error = resolved.Error });
+            }
+            schemaName = resolved.Schema;
+            tableName = resolved.Table;
 
             // Validate table access
             var validationResult = await securityService.ValidateTableAccessAsync(schemaName, tableName);

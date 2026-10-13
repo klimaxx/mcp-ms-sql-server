@@ -11,7 +11,7 @@ namespace McpMsSqlServer.Tools;
 public static class QueryTools
 {
     [McpServerTool]
-    [Description("Execute a SQL SELECT query against the configured schema")]
+    [Description("Execute a SQL SELECT query against the allowed schemas")]
     public static async Task<string> ExecuteQuery(
         [Description("The SQL SELECT query to execute")] string sqlQuery,
         [Description("Maximum number of rows to return (default: 100)")] int maxRows,

@@ -6,7 +6,7 @@ A configurable **Model Context Protocol (MCP) server** for Microsoft SQL Server 
 
 ### 🔧 **Project-Based Configuration**
 - **Multiple database connections** - Switch between different projects and databases
-- **Schema-specific access** - Restrict access to specific schemas per project
+- **Schema-specific access** - Restrict access to one or more schemas per project
 - **Configurable permissions** - Fine-grained control over read/write/delete operations
 - **Environment-based setup** - Different configurations for dev, staging, and production
 
@@ -59,7 +59,7 @@ Create a configuration file for your project in the `Configurations/` directory:
 {
   "name": "My E-Commerce Project",
   "connectionString": "Server=localhost;Database=ECommerceDB;Integrated Security=true;",
-  "allowedSchema": "dbo",
+  "allowedSchemas": ["dbo"],
   "permissions": {
     "allowRead": true,
     "allowWrite": true,
@@ -112,7 +112,7 @@ In Claude Desktop, you can now ask:
 {
   "name": "Project Display Name",
   "connectionString": "Your SQL Server connection string",
-  "allowedSchema": "schema_name",
+  "allowedSchemas": ["schema_name", "other_schema"],
   "permissions": {
     "allowRead": true,
     "allowWrite": true,
@@ -137,6 +137,20 @@ In Claude Desktop, you can now ask:
 }
 ```
 
+### Allowed Schemas
+
+`allowedSchemas` lists every schema a configuration exposes:
+
+- The legacy single-value form `"allowedSchema": "dbo"` still works and is read as `["dbo"]`. If both are present, `allowedSchemas` wins.
+- An empty or missing list means no schema restriction.
+- The **first** entry is the default schema for table tools when no schema is given.
+- Table tools (`GetTableInfo`, `InsertRecords`, `UpdateRecords`, `DeleteRecords`) accept an optional `schemaName` argument or a `schema.table` name. A schema outside the list is rejected.
+- Discovery and analysis tools (`GetSchemaInfo`, `DiscoverData`, `BuildQuery`, `AnalyzeQueryPerformance`, `GetDatabasePerformanceStats`) cover all allowed schemas unless `schemaName` narrows them to one.
+- `ExecuteQuery` rejects queries that reference a schema-qualified table in a schema that is not allowed.
+- `restrictedTables` entries may be qualified (`"sales.Secrets"`, applies only to that schema) or plain (`"Secrets"`, applies to that table name in every schema).
+
+> **Limitation:** unqualified table names in free-form queries are resolved by SQL Server using the login's default schema and cannot be checked client-side. For strict isolation, grant the SQL login access only to the allowed schemas.
+
 ### Example Configurations
 
 <details>
@@ -146,7 +160,7 @@ In Claude Desktop, you can now ask:
 {
   "name": "Development Database",
   "connectionString": "Server=dev-server;Database=DevDB;Integrated Security=true;",
-  "allowedSchema": "dbo",
+  "allowedSchemas": ["dbo"],
   "permissions": {
     "allowRead": true,
     "allowWrite": true,
@@ -169,7 +183,7 @@ In Claude Desktop, you can now ask:
 {
   "name": "Production Database",
   "connectionString": "Server=prod-server;Database=ProdDB;User Id=app_user;Password=secure_password;",
-  "allowedSchema": "app",
+  "allowedSchemas": ["app"],
   "permissions": {
     "allowRead": true,
     "allowWrite": true,
@@ -196,7 +210,7 @@ In Claude Desktop, you can now ask:
 - **TestConnection** - Test database connectivity
 
 ### Core Database Operations (6 tools)
-- **ExecuteQuery** - Run SELECT queries within allowed schema
+- **ExecuteQuery** - Run SELECT queries within the allowed schemas
 - **GetSchemaInfo** - Explore database structure and objects
 - **GetTableInfo** - Get table metadata and sample data
 - **InsertRecords** - Insert new records with transaction support
@@ -276,8 +290,8 @@ dotnet run -- --test-connection --config your-project
 
 **Permission Denied**
 - Check your database user permissions
-- Verify the `allowedSchema` configuration
-- Ensure the user has access to the specified schema
+- Verify the `allowedSchemas` configuration
+- Ensure the user has access to the specified schemas
 
 **Configuration Not Found**
 - Verify the configuration file exists in `Configurations/`

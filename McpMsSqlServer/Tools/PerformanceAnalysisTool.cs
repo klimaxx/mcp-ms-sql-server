@@ -16,6 +16,7 @@ public static class PerformanceAnalysisTool
         string sqlQuery,
         bool includeExecutionPlan,
         bool includeIndexSuggestions,
+        [Description("Optional schema to restrict index suggestions to; must be one of the allowed schemas (default: all allowed schemas)")] string? schemaName,
         DatabaseService databaseService,
         ConfigService configService,
         SecurityService securityService)
@@ -41,6 +42,12 @@ public static class PerformanceAnalysisTool
                     suggestion = "Use ExecuteQuery tool for non-SELECT queries",
                     validationError = validationResult.ErrorMessage
                 });
+            }
+
+            var schemas = securityService.ResolveSchemas(schemaName);
+            if (!schemas.IsValid)
+            {
+                return JsonSerializer.Serialize(new { error = schemas.Error });
             }
 
             // Prepare results
@@ -69,7 +76,7 @@ public static class PerformanceAnalysisTool
             // Get missing index suggestions
             if (includeIndexSuggestions)
             {
-                analysisResults.IndexSuggestions = await GetMissingIndexSuggestions(connection, config.AllowedSchema);
+                analysisResults.IndexSuggestions =await GetMissingIndexSuggestions(connection, schemas.Schemas);
             }
 
             // Analyze query for common issues
@@ -96,8 +103,10 @@ public static class PerformanceAnalysisTool
     public static async Task<string> GetDatabasePerformanceStats(
         int topQueries,
         bool includeWaitStats,
+        [Description("Optional schema to restrict index and table statistics to; must be one of the allowed schemas (default: all allowed schemas)")] string? schemaName,
         DatabaseService databaseService,
-        ConfigService configService)
+        ConfigService configService,
+        SecurityService securityService)
     {
         try
         {
@@ -106,8 +115,12 @@ public static class PerformanceAnalysisTool
                 return JsonSerializer.Serialize(new { error = "No configuration loaded" });
             }
 
-            var config = configService.CurrentConfig;
-            
+            var schemas = securityService.ResolveSchemas(schemaName);
+            if (!schemas.IsValid)
+            {
+                return JsonSerializer.Serialize(new { error = schemas.Error });
+            }
+
             // Default values
             topQueries = topQueries > 0 ? topQueries : 10;
 
@@ -126,10 +139,10 @@ public static class PerformanceAnalysisTool
             }
 
             // Get index usage statistics
-            performanceStats.IndexUsageStats = await GetIndexUsageStatistics(connection, config.AllowedSchema);
+            performanceStats.IndexUsageStats =await GetIndexUsageStatistics(connection, schemas.Schemas);
 
             // Get table statistics
-            performanceStats.TableStats = await GetTableStatistics(connection, config.AllowedSchema);
+            performanceStats.TableStats =await GetTableStatistics(connection, schemas.Schemas);
 
             return JsonSerializer.Serialize(new
             {
@@ -293,7 +306,7 @@ public static class PerformanceAnalysisTool
         result.QueryOptimizations.AddRange(plan.CostlyOperations);
     }
 
-    private static async Task<List<IndexSuggestion>> GetMissingIndexSuggestions(SqlConnection connection, string schema)
+    private static async Task<List<IndexSuggestion>>GetMissingIndexSuggestions(SqlConnection connection, List<string> schemas)
     {
         var suggestions = new List<IndexSuggestion>();
         
@@ -316,7 +329,7 @@ public static class PerformanceAnalysisTool
         while (await reader.ReadAsync())
         {
             var tableName = reader.GetString(0);
-            if (tableName.Contains($"[{schema}]"))
+            if (schemas.Any(schema => tableName.Contains($"[{schema}]", StringComparison.OrdinalIgnoreCase)))
             {
                 suggestions.Add(new IndexSuggestion
                 {
@@ -496,29 +509,31 @@ public static class PerformanceAnalysisTool
         return waitStats;
     }
 
-    private static async Task<List<IndexUsageStatistic>> GetIndexUsageStatistics(SqlConnection connection, string schema)
+    private static async Task<List<IndexUsageStatistic>>GetIndexUsageStatistics(SqlConnection connection, List<string> schemas)
     {
         var indexStats = new List<IndexUsageStatistic>();
         
+        using var cmd = new SqlCommand();
+        cmd.Connection = connection;
+
         var query = @"
-            SELECT 
+            SELECT
                 t.name AS TableName,
                 i.name AS IndexName,
                 i.type_desc AS IndexType,
                 us.user_seeks,
                 us.user_scans,
                 us.user_lookups,
-                us.user_updates
+                us.user_updates,
+                SCHEMA_NAME(t.schema_id) AS SchemaName
             FROM sys.indexes i
             INNER JOIN sys.tables t ON i.object_id = t.object_id
             LEFT JOIN sys.dm_db_index_usage_stats us ON i.object_id = us.object_id AND i.index_id = us.index_id
-            WHERE t.schema_id = SCHEMA_ID(@schema)
+            WHERE SCHEMA_NAME(t.schema_id) IN ({schemas})
             AND i.type > 0
-            ORDER BY t.name, i.name";
+            ORDER BY SCHEMA_NAME(t.schema_id), t.name, i.name";
 
-        using var cmd = new SqlCommand(query, connection);
-        cmd.Parameters.AddWithValue("@schema", schema);
-        
+        cmd.CommandText = query.Replace("{schemas}", AddSchemaParameters(cmd, schemas));
         using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
@@ -530,35 +545,38 @@ public static class PerformanceAnalysisTool
                 UserSeeks = reader.IsDBNull(3) ? 0 : reader.GetInt64(3),
                 UserScans = reader.IsDBNull(4) ? 0 : reader.GetInt64(4),
                 UserLookups = reader.IsDBNull(5) ? 0 : reader.GetInt64(5),
-                UserUpdates = reader.IsDBNull(6) ? 0 : reader.GetInt64(6)
+                UserUpdates = reader.IsDBNull(6) ? 0 : reader.GetInt64(6),
+                Schema = reader.GetString(7)
             });
         }
 
         return indexStats;
     }
 
-    private static async Task<List<TableStatistic>> GetTableStatistics(SqlConnection connection, string schema)
+    private static async Task<List<TableStatistic>>GetTableStatistics(SqlConnection connection, List<string> schemas)
     {
         var tableStats = new List<TableStatistic>();
         
+        using var cmd = new SqlCommand();
+        cmd.Connection = connection;
+
         var query = @"
-            SELECT 
+            SELECT
                 t.name AS TableName,
-                p.rows AS RowCount,
+                p.rows AS [RowCount],
                 SUM(a.total_pages) * 8 AS TotalSpaceKB,
-                SUM(a.used_pages) * 8 AS UsedSpaceKB
+                SUM(a.used_pages) * 8 AS UsedSpaceKB,
+                SCHEMA_NAME(t.schema_id) AS SchemaName
             FROM sys.tables t
             INNER JOIN sys.indexes i ON t.object_id = i.object_id
             INNER JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
             INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
-            WHERE t.schema_id = SCHEMA_ID(@schema)
+            WHERE SCHEMA_NAME(t.schema_id) IN ({schemas})
             AND i.index_id <= 1
-            GROUP BY t.name, p.rows
+            GROUP BY t.schema_id, t.name, p.rows
             ORDER BY p.rows DESC";
 
-        using var cmd = new SqlCommand(query, connection);
-        cmd.Parameters.AddWithValue("@schema", schema);
-        
+        cmd.CommandText = query.Replace("{schemas}", AddSchemaParameters(cmd, schemas));
         using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
@@ -567,11 +585,25 @@ public static class PerformanceAnalysisTool
                 TableName = reader.GetString(0),
                 RowCount = reader.GetInt64(1),
                 TotalSpaceKB = reader.GetInt64(2),
-                UsedSpaceKB = reader.GetInt64(3)
+                UsedSpaceKB = reader.GetInt64(3),
+                Schema = reader.GetString(4)
             });
         }
 
         return tableStats;
+    }
+
+    private static string AddSchemaParameters(SqlCommand cmd, List<string> schemas)
+    {
+        var names = new List<string>();
+        for (var i = 0; i < schemas.Count; i++)
+        {
+            var name = $"@schema{i}";
+            cmd.Parameters.AddWithValue(name, schemas[i]);
+            names.Add(name);
+        }
+
+        return string.Join(", ", names);
     }
 
     private static string GeneratePerformanceSummary(PerformanceAnalysisResult result)
@@ -700,6 +732,7 @@ public static class PerformanceAnalysisTool
 
     private class IndexUsageStatistic
     {
+        public string Schema { get; set; } = "";
         public string TableName { get; set; } = "";
         public string IndexName { get; set; } = "";
         public string IndexType { get; set; } = "";
@@ -711,6 +744,7 @@ public static class PerformanceAnalysisTool
 
     private class TableStatistic
     {
+        public string Schema { get; set; } = "";
         public string TableName { get; set; } = "";
         public long RowCount { get; set; }
         public long TotalSpaceKB { get; set; }

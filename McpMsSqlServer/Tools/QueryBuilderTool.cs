@@ -14,8 +14,9 @@ public static class QueryBuilderTool
     [Description("Generate SQL queries based on natural language descriptions")]
     public static async Task<string> BuildQuery(
         string description,
-        string? tables,
+        [Description("Optional comma-separated table names (may be schema-qualified)")] string? tables,
         string queryType,
+        [Description("Schema for unqualified table names; must be one of the allowed schemas (default: all allowed schemas when tables are detected from the description, otherwise the first allowed schema)")] string? schemaName,
         DatabaseService databaseService,
         ConfigService configService,
         SecurityService securityService)
@@ -28,12 +29,10 @@ public static class QueryBuilderTool
                 return JsonSerializer.Serialize(new { error = "No configuration loaded" });
             }
 
-            var config = configService.CurrentConfig;
-            
             // Default values for optional parameters
             tables ??= null;
             queryType ??= "SELECT";
-            
+
             // Validate query type
             queryType = queryType.ToUpper();
             if (!new[] { "SELECT", "INSERT", "UPDATE", "DELETE" }.Contains(queryType))
@@ -44,50 +43,90 @@ public static class QueryBuilderTool
             // Parse the description to identify key components
             var queryBuilder = new StringBuilder();
             var descriptionLower = description.ToLower();
-            
-            // Parse table names if provided
-            var tableList = tables?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                                  .ToList() ?? new List<string>();
 
-            // If no tables provided, try to extract from description
+            // Parse table names if provided
+            var tableList = new List<(string Schema, string Table)>();
+            var requestedTables = tables?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                                        .ToList() ?? new List<string>();
+            foreach (var entry in requestedTables)
+            {
+                var resolved = securityService.ResolveSchema(schemaName, entry);
+                if (!resolved.IsValid)
+                {
+                    return JsonSerializer.Serialize(new { error = resolved.Error });
+                }
+
+                var access = await securityService.ValidateTableAccessAsync(resolved.Schema, resolved.Table);
+                if (!access.IsValid)
+                {
+                    return JsonSerializer.Serialize(new { error = access.ErrorMessage });
+                }
+
+                tableList.Add((resolved.Schema, resolved.Table));
+            }
+
+            // If no tables provided, try to extract from description across the allowed schemas
             if (!tableList.Any())
             {
-                tableList = await ExtractTableNamesFromDescription(databaseService, config.AllowedSchema, descriptionLower);
+                var schemas = securityService.ResolveSchemas(schemaName);
+                if (!schemas.IsValid)
+                {
+                    return JsonSerializer.Serialize(new { error = schemas.Error });
+                }
+
+                foreach (var schema in schemas.Schemas)
+                {
+                    var found = await ExtractTableNamesFromDescription(databaseService, schema, descriptionLower);
+                    foreach (var table in found)
+                    {
+                        var access = await securityService.ValidateTableAccessAsync(schema, table);
+                        if (access.IsValid)
+                        {
+                            tableList.Add((schema, table));
+                        }
+                    }
+                }
             }
 
             if (!tableList.Any())
             {
-                return JsonSerializer.Serialize(new { 
+                return JsonSerializer.Serialize(new {
                     error = "Could not identify tables. Please specify table names explicitly.",
                     suggestion = "Use the 'tables' parameter to specify which tables to query"
                 });
             }
 
+            var primary = tableList[0];
+
             // Build query based on type
             switch (queryType)
             {
                 case "SELECT":
-                    queryBuilder = BuildSelectQuery(descriptionLower, tableList, config.AllowedSchema);
+                    queryBuilder = BuildSelectQuery(descriptionLower, new List<string> { primary.Table }, primary.Schema);
                     break;
                 case "INSERT":
-                    queryBuilder = BuildInsertTemplate(descriptionLower, tableList[0], config.AllowedSchema);
+                    queryBuilder = BuildInsertTemplate(descriptionLower, primary.Table, primary.Schema);
                     break;
                 case "UPDATE":
-                    queryBuilder = BuildUpdateTemplate(descriptionLower, tableList[0], config.AllowedSchema);
+                    queryBuilder = BuildUpdateTemplate(descriptionLower, primary.Table, primary.Schema);
                     break;
                 case "DELETE":
-                    queryBuilder = BuildDeleteTemplate(descriptionLower, tableList[0], config.AllowedSchema);
+                    queryBuilder = BuildDeleteTemplate(descriptionLower, primary.Table, primary.Schema);
                     break;
             }
+
+            // Names are shown unqualified when everything lives in one schema (original output shape)
+            var multiSchema = tableList.Select(t => t.Schema).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1;
+            string Display((string Schema, string Table) t) => multiSchema ? $"{t.Schema}.{t.Table}" : t.Table;
 
             // Get column information for the tables
             var tableInfo = new Dictionary<string, List<ColumnInfo>>();
             foreach (var table in tableList)
             {
-                var columns = await GetTableColumns(databaseService, config.AllowedSchema, table);
+                var columns = await GetTableColumns(databaseService, table.Schema, table.Table);
                 if (columns.Any())
                 {
-                    tableInfo[table] = columns;
+                    tableInfo[Display(table)] = columns;
                 }
             }
 
@@ -95,18 +134,18 @@ public static class QueryBuilderTool
             var joinSuggestions = new List<string>();
             if (tableList.Count > 1 && queryType == "SELECT")
             {
-                joinSuggestions = await GenerateJoinSuggestions(databaseService, config.AllowedSchema, tableList);
+                joinSuggestions = await GenerateJoinSuggestions(databaseService, tableList);
             }
 
             return JsonSerializer.Serialize(new
             {
                 success = true,
                 generatedQuery = queryBuilder.ToString(),
-                tables = tableList,
+                tables = tableList.Select(Display).ToList(),
                 tableInfo = tableInfo,
                 joinSuggestions = joinSuggestions,
                 notes = GenerateQueryNotes(queryType, descriptionLower),
-                examples = GenerateQueryExamples(queryType, tableList[0], config.AllowedSchema)
+                examples = GenerateQueryExamples(queryType, primary.Table, primary.Schema)
             }, new JsonSerializerOptions { WriteIndented = true });
         }
         catch (Exception ex)
@@ -200,49 +239,55 @@ public static class QueryBuilderTool
 
     private static async Task<List<string>> GenerateJoinSuggestions(
         DatabaseService databaseService,
-        string schema,
-        List<string> tables)
+        List<(string Schema, string Table)> tables)
     {
         var suggestions = new List<string>();
-        
+
         using var connection = databaseService.CreateConnection();
         await connection.OpenAsync();
-        
-        // Find foreign key relationships
+
+        // Find foreign key relationships between a pair of tables (in either direction, possibly across schemas)
         var query = @"
-            SELECT 
+            SELECT
+                fk.TABLE_SCHEMA AS FK_Schema,
                 fk.TABLE_NAME AS FK_Table,
                 fk.COLUMN_NAME AS FK_Column,
+                pk.TABLE_SCHEMA AS PK_Schema,
                 pk.TABLE_NAME AS PK_Table,
                 pk.COLUMN_NAME AS PK_Column
             FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
-            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk 
+            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk
                 ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
-            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE pk 
+                AND rc.CONSTRAINT_SCHEMA = fk.CONSTRAINT_SCHEMA
+            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE pk
                 ON rc.UNIQUE_CONSTRAINT_NAME = pk.CONSTRAINT_NAME
-            WHERE fk.TABLE_SCHEMA = @schema 
-            AND pk.TABLE_SCHEMA = @schema
-            AND fk.TABLE_NAME IN (@table1, @table2)
-            AND pk.TABLE_NAME IN (@table1, @table2)";
-        
+                AND rc.UNIQUE_CONSTRAINT_SCHEMA = pk.CONSTRAINT_SCHEMA
+            WHERE (fk.TABLE_SCHEMA = @schema1 AND fk.TABLE_NAME = @table1
+                   AND pk.TABLE_SCHEMA = @schema2 AND pk.TABLE_NAME = @table2)
+               OR (fk.TABLE_SCHEMA = @schema2 AND fk.TABLE_NAME = @table2
+                   AND pk.TABLE_SCHEMA = @schema1 AND pk.TABLE_NAME = @table1)";
+
         for (int i = 0; i < tables.Count - 1; i++)
         {
             for (int j = i + 1; j < tables.Count; j++)
             {
                 using var command = new SqlCommand(query, connection);
-                command.Parameters.AddWithValue("@schema", schema);
-                command.Parameters.AddWithValue("@table1", tables[i]);
-                command.Parameters.AddWithValue("@table2", tables[j]);
-                
+                command.Parameters.AddWithValue("@schema1", tables[i].Schema);
+                command.Parameters.AddWithValue("@table1", tables[i].Table);
+                command.Parameters.AddWithValue("@schema2", tables[j].Schema);
+                command.Parameters.AddWithValue("@table2", tables[j].Table);
+
                 using var reader = await command.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
                 {
-                    var fkTable = reader.GetString(0);
-                    var fkColumn = reader.GetString(1);
-                    var pkTable = reader.GetString(2);
-                    var pkColumn = reader.GetString(3);
-                    
-                    suggestions.Add($"JOIN {schema}.{pkTable} ON {schema}.{fkTable}.{fkColumn} = {schema}.{pkTable}.{pkColumn}");
+                    var fkSchema = reader.GetString(0);
+                    var fkTable = reader.GetString(1);
+                    var fkColumn = reader.GetString(2);
+                    var pkSchema = reader.GetString(3);
+                    var pkTable = reader.GetString(4);
+                    var pkColumn = reader.GetString(5);
+
+                    suggestions.Add($"JOIN {pkSchema}.{pkTable} ON {fkSchema}.{fkTable}.{fkColumn} = {pkSchema}.{pkTable}.{pkColumn}");
                 }
             }
         }

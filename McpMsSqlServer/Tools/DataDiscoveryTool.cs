@@ -11,13 +11,15 @@ namespace McpMsSqlServer.Tools;
 public static class DataDiscoveryTool
 {
     [McpServerTool]
-    [Description("Search for tables and columns by name patterns and discover relationships")]
+    [Description("Search for tables and columns by name patterns and discover relationships across the allowed schemas")]
     public static async Task<string> DiscoverData(
         string searchPattern,
         string searchType,
         bool includeDataProfile,
+        [Description("Optional schema to restrict the search to; must be one of the allowed schemas (default: all allowed schemas)")] string? schemaName,
         DatabaseService databaseService,
-        ConfigService configService)
+        ConfigService configService,
+        SecurityService securityService)
     {
         try
         {
@@ -26,8 +28,12 @@ public static class DataDiscoveryTool
                 return JsonSerializer.Serialize(new { error = "No configuration loaded" });
             }
 
-            var config = configService.CurrentConfig;
-            
+            var schemas = securityService.ResolveSchemas(schemaName);
+            if (!schemas.IsValid)
+            {
+                return JsonSerializer.Serialize(new { error = schemas.Error });
+            }
+
             // Default values
             searchType ??= "both";
 
@@ -36,38 +42,53 @@ public static class DataDiscoveryTool
             using var connection = databaseService.CreateConnection();
             await connection.OpenAsync();
 
-            // Search based on type
             searchType = searchType.ToLower();
-            if (searchType == "table" || searchType == "both")
+            foreach (var schema in schemas.Schemas)
             {
-                discoveryResult.Tables = await SearchTables(connection, config.AllowedSchema, searchPattern);
-            }
+                var tables = new List<TableSearchResult>();
+                var columns = new List<ColumnSearchResult>();
 
-            if (searchType == "column" || searchType == "both")
-            {
-                discoveryResult.Columns = await SearchColumns(connection, config.AllowedSchema, searchPattern);
-            }
+                if (searchType == "table" || searchType == "both")
+                {
+                    tables = await SearchTables(connection, schema, searchPattern);
+                    tables.ForEach(t => t.Schema = schema);
+                    discoveryResult.Tables.AddRange(tables);
+                }
 
-            // Get relationships for found tables
-            var allTables = discoveryResult.Tables.Select(t => t.TableName)
-                .Union(discoveryResult.Columns.Select(c => c.TableName))
-                .Distinct()
-                .ToList();
+                if (searchType == "column" || searchType == "both")
+                {
+                    columns = await SearchColumns(connection, schema, searchPattern);
+                    columns.ForEach(c => c.Schema = schema);
+                    discoveryResult.Columns.AddRange(columns);
+                }
 
-            if (allTables.Any())
-            {
-                discoveryResult.Relationships = await DiscoverRelationships(connection, config.AllowedSchema, allTables);
-            }
+                // Get relationships for tables found in this schema
+                var schemaTables = tables.Select(t => t.TableName)
+                    .Union(columns.Select(c => c.TableName))
+                    .Distinct()
+                    .ToList();
 
-            // Get data profiling if requested
-            if (includeDataProfile && allTables.Any())
-            {
-                discoveryResult.DataProfiles = await ProfileData(connection, config.AllowedSchema, allTables.Take(10).ToList());
+                if (schemaTables.Any())
+                {
+                    var relationships = await DiscoverRelationships(connection, schema, schemaTables);
+                    relationships.ForEach(r => r.Schema = schema);
+                    discoveryResult.Relationships.AddRange(relationships);
+                }
+
+                // Get data profiling if requested (at most 10 tables overall)
+                var profileBudget = 10 - discoveryResult.DataProfiles.Count;
+                if (includeDataProfile && schemaTables.Any() && profileBudget > 0)
+                {
+                    var profiles = await ProfileData(connection, schema, schemaTables.Take(profileBudget).ToList());
+                    profiles.ForEach(p => p.Schema = schema);
+                    discoveryResult.DataProfiles.AddRange(profiles);
+                }
             }
 
             return JsonSerializer.Serialize(new
             {
                 success = true,
+                schemas = schemas.Schemas,
                 discovery = discoveryResult,
                 summary = GenerateDiscoverySummary(discoveryResult)
             }, new JsonSerializerOptions { WriteIndented = true });
@@ -79,13 +100,15 @@ public static class DataDiscoveryTool
     }
 
     [McpServerTool]
-    [Description("Find all relationships and dependencies for specified tables")]
+    [Description("Find all relationships and dependencies for specified tables (names may be schema-qualified)")]
     public static async Task<string> AnalyzeTableRelationships(
         string tableNames,
         bool includeReferencingTables,
         bool includeReferencedTables,
+        [Description("Schema for unqualified table names; must be one of the allowed schemas (default: first allowed schema)")] string? schemaName,
         DatabaseService databaseService,
-        ConfigService configService)
+        ConfigService configService,
+        SecurityService securityService)
     {
         try
         {
@@ -94,15 +117,32 @@ public static class DataDiscoveryTool
                 return JsonSerializer.Serialize(new { error = "No configuration loaded" });
             }
 
-            var config = configService.CurrentConfig;
-            
-            // Default values are already set by parameters
+            var requested = new List<(string Schema, string Table)>();
+            foreach (var entry in tableNames.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var resolved = securityService.ResolveSchema(schemaName, entry);
+                if (!resolved.IsValid)
+                {
+                    return JsonSerializer.Serialize(new { error = resolved.Error });
+                }
 
-            var tables = tableNames.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            
+                var access = await securityService.ValidateTableAccessAsync(resolved.Schema, resolved.Table);
+                if (!access.IsValid)
+                {
+                    return JsonSerializer.Serialize(new { error = access.ErrorMessage });
+                }
+
+                requested.Add((resolved.Schema, resolved.Table));
+            }
+
+            // Unqualified names are kept as-is when everything lives in one schema (original output shape)
+            var multiSchema = requested.Select(t => t.Schema).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1;
+            string Display(string schema, string table, string anchorSchema) =>
+                multiSchema || !schema.Equals(anchorSchema, StringComparison.OrdinalIgnoreCase) ? $"{schema}.{table}" : table;
+
             var relationshipAnalysis = new RelationshipAnalysis
             {
-                AnalyzedTables = tables,
+                AnalyzedTables = requested.Select(t => Display(t.Schema, t.Table, t.Schema)).ToList(),
                 ForeignKeys = new List<ForeignKeyInfo>(),
                 ReferencingTables = new Dictionary<string, List<string>>(),
                 ReferencedTables = new Dictionary<string, List<string>>(),
@@ -113,26 +153,42 @@ public static class DataDiscoveryTool
             await connection.OpenAsync();
 
             // Get all foreign keys for the tables
-            relationshipAnalysis.ForeignKeys = await GetForeignKeys(connection, config.AllowedSchema, tables);
+            foreach (var group in requested.GroupBy(t => t.Schema, StringComparer.OrdinalIgnoreCase))
+            {
+                var keys = await GetForeignKeys(connection, group.Key, group.Select(t => t.Table).ToList());
+                keys.ForEach(k => k.Schema = group.Key);
+                relationshipAnalysis.ForeignKeys.AddRange(keys);
+            }
 
             // Build referencing/referenced tables maps
-            foreach (var table in tables)
+            foreach (var (schema, table) in requested)
             {
+                var key = Display(schema, table, schema);
+
                 if (includeReferencingTables)
                 {
-                    relationshipAnalysis.ReferencingTables[table] = await GetReferencingTables(connection, config.AllowedSchema, table);
+                    var referencing = await GetReferencingTables(connection, schema, table);
+                    relationshipAnalysis.ReferencingTables[key] = referencing
+                        .Where(r => securityService.IsSchemaAllowed(r.Schema))
+                        .Select(r => Display(r.Schema, r.Table, schema))
+                        .ToList();
                 }
 
                 if (includeReferencedTables)
                 {
-                    relationshipAnalysis.ReferencedTables[table] = await GetReferencedTables(connection, config.AllowedSchema, table);
+                    var referenced = await GetReferencedTables(connection, schema, table);
+                    relationshipAnalysis.ReferencedTables[key] = referenced
+                        .Where(r => securityService.IsSchemaAllowed(r.Schema))
+                        .Select(r => Display(r.Schema, r.Table, schema))
+                        .ToList();
                 }
             }
 
             // Build dependency tree
-            foreach (var table in tables)
+            foreach (var (schema, table) in requested)
             {
-                relationshipAnalysis.DependencyTree[table] = await BuildDependencyTree(connection, config.AllowedSchema, table, new HashSet<string>());
+                relationshipAnalysis.DependencyTree[Display(schema, table, schema)] =
+                    await BuildDependencyTree(connection, securityService, schema, table, new HashSet<string>());
             }
 
             // Generate relationship diagram
@@ -153,12 +209,14 @@ public static class DataDiscoveryTool
     }
 
     [McpServerTool]
-    [Description("Profile data quality and statistics for specified tables")]
+    [Description("Profile data quality and statistics for specified tables (names may be schema-qualified)")]
     public static async Task<string> ProfileDataQuality(
         string tableNames,
         int sampleSize,
+        [Description("Schema for unqualified table names; must be one of the allowed schemas (default: first allowed schema)")] string? schemaName,
         DatabaseService databaseService,
-        ConfigService configService)
+        ConfigService configService,
+        SecurityService securityService)
     {
         try
         {
@@ -167,23 +225,38 @@ public static class DataDiscoveryTool
                 return JsonSerializer.Serialize(new { error = "No configuration loaded" });
             }
 
-            var config = configService.CurrentConfig;
-            
             // Default value
             sampleSize = sampleSize > 0 ? sampleSize : 1000;
 
-            var tables = tableNames.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            
+            var requested = new List<(string Schema, string Table)>();
+            foreach (var entry in tableNames.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var resolved = securityService.ResolveSchema(schemaName, entry);
+                if (!resolved.IsValid)
+                {
+                    return JsonSerializer.Serialize(new { error = resolved.Error });
+                }
+
+                var access = await securityService.ValidateTableAccessAsync(resolved.Schema, resolved.Table);
+                if (!access.IsValid)
+                {
+                    return JsonSerializer.Serialize(new { error = access.ErrorMessage });
+                }
+
+                requested.Add((resolved.Schema, resolved.Table));
+            }
+
             var qualityProfiles = new List<DataQualityProfile>();
 
             using var connection = databaseService.CreateConnection();
             await connection.OpenAsync();
 
-            foreach (var table in tables)
+            foreach (var (schema, table) in requested)
             {
-                var profile = await ProfileTableDataQuality(connection, config.AllowedSchema, table, sampleSize);
+                var profile = await ProfileTableDataQuality(connection, schema, table, sampleSize);
                 if (profile != null)
                 {
+                    profile.Schema = schema;
                     qualityProfiles.Add(profile);
                 }
             }
@@ -210,7 +283,7 @@ public static class DataDiscoveryTool
             SELECT 
                 t.TABLE_NAME,
                 t.TABLE_TYPE,
-                p.rows as RowCount,
+                p.rows as [RowCount],
                 (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS c WHERE c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME) as ColumnCount
             FROM INFORMATION_SCHEMA.TABLES t
             LEFT JOIN sys.partitions p ON p.object_id = OBJECT_ID(t.TABLE_SCHEMA + '.' + t.TABLE_NAME) AND p.index_id IN (0,1)
@@ -295,7 +368,7 @@ public static class DataDiscoveryTool
                 fk.update_referential_action_desc AS UpdateAction
             FROM sys.foreign_keys fk
             INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
-            WHERE SCHEMA_NAME(fk.schema_id) = @schema
+            WHERE (OBJECT_SCHEMA_NAME(fk.parent_object_id) = @schema OR OBJECT_SCHEMA_NAME(fk.referenced_object_id) = @schema)
             AND (OBJECT_NAME(fk.parent_object_id) IN (SELECT value FROM STRING_SPLIT(@tables, ','))
                 OR OBJECT_NAME(fk.referenced_object_id) IN (SELECT value FROM STRING_SPLIT(@tables, ',')))
             ORDER BY FK_Table, FK_Column";
@@ -427,7 +500,7 @@ public static class DataDiscoveryTool
                        WHERE fkc2.constraint_object_id = fk.object_id
                        FOR XML PATH('')), 1, 2, '') AS PKColumns
             FROM sys.foreign_keys fk
-            WHERE SCHEMA_NAME(fk.schema_id) = @schema
+            WHERE OBJECT_SCHEMA_NAME(fk.parent_object_id) = @schema
             AND OBJECT_NAME(fk.parent_object_id) IN (SELECT value FROM STRING_SPLIT(@tables, ','))
             ORDER BY FKTable";
 
@@ -451,16 +524,16 @@ public static class DataDiscoveryTool
         return foreignKeys;
     }
 
-    private static async Task<List<string>> GetReferencingTables(SqlConnection connection, string schema, string table)
+    private static async Task<List<(string Schema, string Table)>> GetReferencingTables(SqlConnection connection, string schema, string table)
     {
-        var referencingTables = new List<string>();
-        
+        var referencingTables = new List<(string Schema, string Table)>();
+
         var query = @"
-            SELECT DISTINCT OBJECT_NAME(fk.parent_object_id) AS ReferencingTable
+            SELECT DISTINCT OBJECT_SCHEMA_NAME(fk.parent_object_id) AS ReferencingSchema, OBJECT_NAME(fk.parent_object_id) AS ReferencingTable
             FROM sys.foreign_keys fk
-            WHERE SCHEMA_NAME(fk.schema_id) = @schema
+            WHERE OBJECT_SCHEMA_NAME(fk.referenced_object_id) = @schema
             AND OBJECT_NAME(fk.referenced_object_id) = @table
-            ORDER BY ReferencingTable";
+            ORDER BY ReferencingSchema, ReferencingTable";
 
         using var cmd = new SqlCommand(query, connection);
         cmd.Parameters.AddWithValue("@schema", schema);
@@ -469,22 +542,22 @@ public static class DataDiscoveryTool
         using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
-            referencingTables.Add(reader.GetString(0));
+            referencingTables.Add((reader.GetString(0), reader.GetString(1)));
         }
 
         return referencingTables;
     }
 
-    private static async Task<List<string>> GetReferencedTables(SqlConnection connection, string schema, string table)
+    private static async Task<List<(string Schema, string Table)>> GetReferencedTables(SqlConnection connection, string schema, string table)
     {
-        var referencedTables = new List<string>();
-        
+        var referencedTables = new List<(string Schema, string Table)>();
+
         var query = @"
-            SELECT DISTINCT OBJECT_NAME(fk.referenced_object_id) AS ReferencedTable
+            SELECT DISTINCT OBJECT_SCHEMA_NAME(fk.referenced_object_id) AS ReferencedSchema, OBJECT_NAME(fk.referenced_object_id) AS ReferencedTable
             FROM sys.foreign_keys fk
-            WHERE SCHEMA_NAME(fk.schema_id) = @schema
+            WHERE OBJECT_SCHEMA_NAME(fk.parent_object_id) = @schema
             AND OBJECT_NAME(fk.parent_object_id) = @table
-            ORDER BY ReferencedTable";
+            ORDER BY ReferencedSchema, ReferencedTable";
 
         using var cmd = new SqlCommand(query, connection);
         cmd.Parameters.AddWithValue("@schema", schema);
@@ -493,31 +566,39 @@ public static class DataDiscoveryTool
         using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
-            referencedTables.Add(reader.GetString(0));
+            referencedTables.Add((reader.GetString(0), reader.GetString(1)));
         }
 
         return referencedTables;
     }
 
-    private static async Task<DependencyNode> BuildDependencyTree(SqlConnection connection, string schema, string table, HashSet<string> visited)
+    private static async Task<DependencyNode> BuildDependencyTree(SqlConnection connection, SecurityService securityService, string schema, string table, HashSet<string> visited)
     {
-        if (visited.Contains(table))
+        var visitKey = $"{schema}.{table}";
+        if (visited.Contains(visitKey))
         {
-            return new DependencyNode { TableName = table, IsCircular = true };
+            return new DependencyNode { Schema = schema, TableName = table, IsCircular = true };
         }
 
-        visited.Add(table);
-        
+        visited.Add(visitKey);
+
         var node = new DependencyNode
         {
+            Schema = schema,
             TableName = table,
             Dependencies = new List<DependencyNode>()
         };
 
         var referencedTables = await GetReferencedTables(connection, schema, table);
-        foreach (var refTable in referencedTables)
+        foreach (var (refSchema, refTable) in referencedTables)
         {
-            var childNode = await BuildDependencyTree(connection, schema, refTable, new HashSet<string>(visited));
+            // Do not expose or traverse tables outside the allowed schemas
+            if (!securityService.IsSchemaAllowed(refSchema))
+            {
+                continue;
+            }
+
+            var childNode = await BuildDependencyTree(connection, securityService, refSchema, refTable, new HashSet<string>(visited));
             node.Dependencies.Add(childNode);
         }
 
@@ -873,6 +954,7 @@ public static class DataDiscoveryTool
 
     private class TableSearchResult
     {
+        public string Schema { get; set; } = "";
         public string TableName { get; set; } = "";
         public string TableType { get; set; } = "";
         public long RowCount { get; set; }
@@ -881,6 +963,7 @@ public static class DataDiscoveryTool
 
     private class ColumnSearchResult
     {
+        public string Schema { get; set; } = "";
         public string TableName { get; set; } = "";
         public string ColumnName { get; set; } = "";
         public string DataType { get; set; } = "";
@@ -893,6 +976,7 @@ public static class DataDiscoveryTool
 
     private class TableRelationship
     {
+        public string Schema { get; set; } = "";
         public string ConstraintName { get; set; } = "";
         public string ForeignKeyTable { get; set; } = "";
         public string ForeignKeyColumn { get; set; } = "";
@@ -904,6 +988,7 @@ public static class DataDiscoveryTool
 
     private class DataProfile
     {
+        public string Schema { get; set; } = "";
         public string TableName { get; set; } = "";
         public List<ColumnProfile> ColumnProfiles { get; set; } = new();
     }
@@ -931,6 +1016,7 @@ public static class DataDiscoveryTool
 
     private class ForeignKeyInfo
     {
+        public string Schema { get; set; } = "";
         public string ConstraintName { get; set; } = "";
         public string ForeignKeyTable { get; set; } = "";
         public string ForeignKeyColumns { get; set; } = "";
@@ -940,6 +1026,7 @@ public static class DataDiscoveryTool
 
     private class DependencyNode
     {
+        public string Schema { get; set; } = "";
         public string TableName { get; set; } = "";
         public List<DependencyNode> Dependencies { get; set; } = new();
         public bool IsCircular { get; set; }
@@ -947,6 +1034,7 @@ public static class DataDiscoveryTool
 
     private class DataQualityProfile
     {
+        public string Schema { get; set; } = "";
         public string TableName { get; set; } = "";
         public int TotalRows { get; set; }
         public List<ColumnQualityMetric> ColumnQualityMetrics { get; set; } = new();

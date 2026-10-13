@@ -11,30 +11,62 @@ namespace McpMsSqlServer.Tools;
 public static class SchemaTools
 {
     [McpServerTool]
-    [Description("Get database schema information for the configured schema")]
+    [Description("Get database schema information for the allowed schemas (all of them, or one via schemaName)")]
     public static async Task<string> GetSchemaInfo(
-        [Description("Optional table name to get specific table info")] string? tableName,
+        [Description("Optional table name to get specific table info (may be schema-qualified)")] string? tableName,
+        [Description("Optional schema to restrict the result to; must be one of the allowed schemas")] string? schemaName,
         DatabaseService databaseService,
-        ConfigService configService)
+        ConfigService configService,
+        SecurityService securityService)
     {
         try
         {
-            var config = configService.CurrentConfig;
-            var schemaName = config.AllowedSchema;
-
-            using var connection = databaseService.CreateConnection();
-            await connection.OpenAsync();
-
             if (!string.IsNullOrEmpty(tableName))
             {
-                // Get specific table info
-                return await GetTableSchema(connection, schemaName, tableName);
+                var resolved = securityService.ResolveSchema(schemaName, tableName);
+                if (!resolved.IsValid)
+                {
+                    return JsonSerializer.Serialize(new { error = resolved.Error });
+                }
+
+                using var connection = databaseService.CreateConnection();
+                await connection.OpenAsync();
+                return await GetTableSchema(connection, resolved.Schema, resolved.Table);
             }
-            else
+
+            var schemas = securityService.ResolveSchemas(schemaName);
+            if (!schemas.IsValid)
             {
-                // Get all tables and views in schema
-                return await GetAllTablesInSchema(connection, schemaName);
+                return JsonSerializer.Serialize(new { error = schemas.Error });
             }
+
+            using var conn = databaseService.CreateConnection();
+            await conn.OpenAsync();
+
+            var perSchema = new List<object>();
+            var allTables = new List<object>();
+            foreach (var schema in schemas.Schemas)
+            {
+                var tables = await GetAllTablesInSchema(conn, schema);
+                perSchema.Add(new { schema, tableCount = tables.Count, tables });
+                allTables.AddRange(tables);
+            }
+
+            var result = new Dictionary<string, object>
+            {
+                ["success"] = true,
+                ["schemas"] = perSchema
+            };
+
+            // Keep the original single-schema shape for existing clients
+            if (schemas.Schemas.Count == 1)
+            {
+                result["schema"] = schemas.Schemas[0];
+                result["tableCount"] = allTables.Count;
+                result["tables"] = allTables;
+            }
+
+            return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
         }
         catch (Exception ex)
         {
@@ -42,7 +74,7 @@ public static class SchemaTools
         }
     }
 
-    private static async Task<string> GetAllTablesInSchema(SqlConnection connection, string schemaName)
+    private static async Task<List<object>> GetAllTablesInSchema(SqlConnection connection, string schemaName)
     {
         var query = @"
             SELECT 
@@ -65,19 +97,14 @@ public static class SchemaTools
         {
             tables.Add(new
             {
+                schema = schemaName,
                 name = reader.GetString(0),
                 type = reader.GetString(1),
                 rowCount = reader.IsDBNull(2) ? null : (long?)reader.GetInt64(2)
             });
         }
 
-        return JsonSerializer.Serialize(new
-        {
-            success = true,
-            schema = schemaName,
-            tableCount = tables.Count,
-            tables = tables
-        }, new JsonSerializerOptions { WriteIndented = true });
+        return tables;
     }
 
     private static async Task<string> GetTableSchema(SqlConnection connection, string schemaName, string tableName)

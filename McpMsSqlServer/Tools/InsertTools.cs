@@ -12,9 +12,10 @@ namespace McpMsSqlServer.Tools;
 public static class InsertTools
 {
     [McpServerTool]
-    [Description("Insert new records into a table in the configured schema")]
+    [Description("Insert new records into a table in one of the allowed schemas")]
     public static async Task<string> InsertRecords(
-        [Description("The table name to insert into")] string tableName,
+        [Description("The table name to insert into (may be schema-qualified, e.g. Trading.Orders)")] string tableName,
+        [Description("Schema containing the table; must be one of the allowed schemas (default: first allowed schema)")] string? schemaName,
         [Description("JSON object or array of objects with column-value pairs")] string recordsJson,
         [Description("Whether to use a transaction (default: true)")] bool useTransaction,
         DatabaseService databaseService,
@@ -30,7 +31,13 @@ public static class InsertTools
                 return JsonSerializer.Serialize(new { error = "Write operations are not allowed for this configuration" });
             }
 
-            var schemaName = config.AllowedSchema;
+            var resolved = securityService.ResolveSchema(schemaName, tableName);
+            if (!resolved.IsValid)
+            {
+                return JsonSerializer.Serialize(new { error = resolved.Error });
+            }
+            schemaName = resolved.Schema;
+            tableName = resolved.Table;
 
             // Validate table access
             var validationResult = await securityService.ValidateTableAccessAsync(schemaName, tableName);
