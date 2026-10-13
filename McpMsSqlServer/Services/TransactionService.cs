@@ -17,7 +17,7 @@ public class TransactionService
     
     public async Task<T> ExecuteInTransactionAsync<T>(Func<SqlConnection, SqlTransaction, Task<T>> operation)
     {
-        using var connection = new SqlConnection(_configService.CurrentConfig.ConnectionString);
+        using var connection = new SqlConnection(_configService.GetConnectionString());
         await connection.OpenAsync();
         
         using var transaction = connection.BeginTransaction();

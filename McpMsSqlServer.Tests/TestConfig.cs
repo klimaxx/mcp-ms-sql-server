@@ -12,11 +12,15 @@ public sealed class TestConfig : IDisposable
 
     public ConfigService ConfigService { get; }
 
-    public TestConfig(string defaultJson)
+    public TestConfig(string defaultJson, IDictionary<string, string>? additionalConfigs = null)
     {
         _dir = Path.Combine(Path.GetTempPath(), "mcp-sql-tests-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_dir);
         File.WriteAllText(Path.Combine(_dir, "default.json"), defaultJson);
+        foreach (var (name, json) in additionalConfigs ?? new Dictionary<string, string>())
+        {
+            File.WriteAllText(Path.Combine(_dir, name + ".json"), json);
+        }
 
         lock (EnvLock)
         {

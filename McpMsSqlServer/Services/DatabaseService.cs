@@ -143,6 +143,6 @@ public class DatabaseService
     
     public SqlConnection CreateConnection()
     {
-        return new SqlConnection(_configService.CurrentConfig.ConnectionString);
+        return new SqlConnection(_configService.GetConnectionString());
     }
 }

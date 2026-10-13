@@ -10,6 +10,17 @@ public class DatabaseConfig
     public string ConnectionString { get; set; } = string.Empty;
 
     /// <summary>
+    /// <see cref="ConnectionString"/> with <c>${NAME}</c> placeholders expanded. Set by
+    /// ConfigService at load time; never serialized so secrets cannot leak through config output.
+    /// </summary>
+    [JsonIgnore]
+    public string? ResolvedConnectionString { get; set; }
+
+    /// <summary>Environment variables referenced by <see cref="ConnectionString"/> that are not set.</summary>
+    [JsonIgnore]
+    public IReadOnlyList<string> MissingEnvironmentVariables { get; set; } = Array.Empty<string>();
+
+    /// <summary>
     /// Schemas exposed by this configuration. Empty means no schema restriction.
     /// </summary>
     public List<string> AllowedSchemas

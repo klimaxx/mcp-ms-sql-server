@@ -1,10 +1,13 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using McpMsSqlServer.Models;
 
 namespace McpMsSqlServer.Services;
 
 public class ConfigService
 {
+    private static readonly Regex EnvPlaceholder = new(@"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", RegexOptions.Compiled);
+
     private readonly string _configPath;
     private Dictionary<string, DatabaseConfig> _configurations = new();
     private string _currentConfigName = "default";
@@ -58,6 +61,14 @@ public class ConfigService
                 if (config != null)
                 {
                     var configName = Path.GetFileNameWithoutExtension(file);
+                    ResolveConnectionString(config);
+                    if (config.MissingEnvironmentVariables.Count > 0)
+                    {
+                        // Names only: resolved values must never be written anywhere.
+                        Console.Error.WriteLine(
+                            $"Configuration {configName}: environment variable(s) not set: " +
+                            string.Join(", ", config.MissingEnvironmentVariables));
+                    }
                     _configurations[configName] = config;
                 }
             }
@@ -73,6 +84,45 @@ public class ConfigService
         }
     }
     
+    private static void ResolveConnectionString(DatabaseConfig config)
+    {
+        var missing = new List<string>();
+
+        // Single pass: substituted values are not rescanned for further placeholders.
+        config.ResolvedConnectionString = EnvPlaceholder.Replace(config.ConnectionString, match =>
+        {
+            var name = match.Groups[1].Value;
+            var value = Environment.GetEnvironmentVariable(name);
+            if (value == null)
+            {
+                if (!missing.Contains(name))
+                {
+                    missing.Add(name);
+                }
+                return match.Value;
+            }
+            return value;
+        });
+        config.MissingEnvironmentVariables = missing;
+    }
+
+    /// <summary>
+    /// Connection string of the current configuration with environment placeholders expanded.
+    /// Throws when a referenced variable is not set, so a literal or partially expanded
+    /// string is never used to connect.
+    /// </summary>
+    public string GetConnectionString()
+    {
+        var config = CurrentConfig;
+        if (config.MissingEnvironmentVariables.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"Configuration '{_currentConfigName}' references environment variable(s) that are not set: " +
+                string.Join(", ", config.MissingEnvironmentVariables));
+        }
+        return config.ResolvedConnectionString ?? config.ConnectionString;
+    }
+
     public DatabaseConfig GetConfiguration(string name)
     {
         return _configurations.TryGetValue(name, out var config) 

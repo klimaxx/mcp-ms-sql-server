@@ -249,6 +249,14 @@ export DB_PASSWORD="your_secure_password"
 }
 ```
 
+How substitution works:
+
+- Only `${NAME}` is recognised (`NAME` = letters, digits, underscore; not starting with a digit), and only inside `connectionString`.
+- Variables are read once, when the server starts, so set them in the environment the MCP client launches the server with (e.g. the `env` block of the client's server entry) and restart the server after changing them.
+- If a referenced variable is not set, the configuration still appears in the list, but every tool that needs the database returns an error naming the missing variable(s). The server never connects with the literal `${...}` text.
+- Values are inserted as-is. If a password contains `;`, `=` or quotes, wrap it in the quoting SQL Server connection strings require (e.g. `'my;pass'`) in the variable's value.
+- Resolved values are never included in tool output or error messages.
+
 ## 🤝 Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
