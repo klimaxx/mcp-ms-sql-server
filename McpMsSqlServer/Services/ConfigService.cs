@@ -13,6 +13,9 @@ public class ConfigService
     private string _currentConfigName = "default";
     
     public DatabaseConfig CurrentConfig => GetConfiguration(_currentConfigName);
+
+    /// <summary>Identifier (file name without extension) of the active configuration.</summary>
+    public string CurrentConfigurationId => _currentConfigName;
     
     public ConfigService()
     {
@@ -135,12 +138,37 @@ public class ConfigService
         return _configurations.Keys.ToList();
     }
     
+    /// <summary>Identifier (file name without extension) of each configuration with its display name.</summary>
+    public List<(string Configuration, string Name)> ListConfigurationDetails()
+    {
+        return _configurations.Select(c => (c.Key, c.Value.Name)).ToList();
+    }
+
     public string SwitchConfiguration(string configName)
     {
+        // Exact match first; otherwise a single case-insensitive match. The display
+        // name is deliberately never consulted: it is not unique.
+        string? resolved = null;
         if (_configurations.ContainsKey(configName))
         {
-            _currentConfigName = configName;
-            return $"Switched to configuration: {configName}";
+            resolved = configName;
+        }
+        else
+        {
+            var candidates = _configurations.Keys
+                .Where(k => string.Equals(k, configName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (candidates.Count > 1)
+            {
+                return $"Configuration '{configName}' is ambiguous: matches {string.Join(", ", candidates)}. Use the exact identifier.";
+            }
+            resolved = candidates.FirstOrDefault();
+        }
+
+        if (resolved != null)
+        {
+            _currentConfigName = resolved;
+            return $"Switched to configuration: {resolved}";
         }
         return $"Configuration '{configName}' not found. Available: {string.Join(", ", _configurations.Keys)}";
     }
@@ -150,6 +178,7 @@ public class ConfigService
         var config = CurrentConfig;
         return JsonSerializer.Serialize(new
         {
+            Configuration = _currentConfigName,
             Name = config.Name,
             AllowedSchemas = config.AllowedSchemas,
             Permissions = config.Permissions,

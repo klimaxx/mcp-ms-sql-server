@@ -46,6 +46,7 @@ public class DatabaseService
                 DataSource = connection.DataSource,
                 ServerVersion = connection.ServerVersion,
                 State = connection.State.ToString(),
+                Configuration = _configService.CurrentConfigurationId,
                 ConfigName = _configService.CurrentConfig.Name,
                 AllowedSchemas = _configService.CurrentConfig.AllowedSchemas
             };
@@ -58,6 +59,7 @@ public class DatabaseService
             {
                 Success = false,
                 Error = ex.Message,
+                Configuration = _configService.CurrentConfigurationId,
                 ConfigName = _configService.CurrentConfig.Name
             };
             

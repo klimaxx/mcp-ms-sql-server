@@ -12,7 +12,10 @@ public sealed class TestConfig : IDisposable
 
     public ConfigService ConfigService { get; }
 
-    public TestConfig(string defaultJson, IDictionary<string, string>? additionalConfigs = null)
+    public TestConfig(
+        string defaultJson,
+        IDictionary<string, string>? additionalConfigs = null,
+        string? initialConfigName = null)
     {
         _dir = Path.Combine(Path.GetTempPath(), "mcp-sql-tests-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_dir);
@@ -29,7 +32,7 @@ public sealed class TestConfig : IDisposable
             try
             {
                 Environment.SetEnvironmentVariable("MCP_CONFIG_PATH", _dir);
-                Environment.SetEnvironmentVariable("MCP_CONFIG_NAME", null);
+                Environment.SetEnvironmentVariable("MCP_CONFIG_NAME", initialConfigName);
                 ConfigService = new ConfigService();
             }
             finally

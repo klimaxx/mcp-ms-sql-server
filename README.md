@@ -204,10 +204,12 @@ In Claude Desktop, you can now ask:
 ## 🛠️ Available Tools
 
 ### Configuration Management (4 tools)
-- **ListConfigurations** - Show all available project configurations
-- **SwitchConfiguration** - Switch to a different project configuration
-- **GetCurrentConfiguration** - View current configuration details
-- **TestConnection** - Test database connectivity
+- **ListConfigurations** - Show all available project configurations (`configurations`: identifiers; `details`: identifier + display name)
+- **SwitchConfiguration** - Switch to a different project configuration by identifier (case-insensitive)
+- **GetCurrentConfiguration** - View current configuration details (`Configuration` = identifier, `Name` = display name)
+- **TestConnection** - Test database connectivity (reports `Configuration` and `ConfigName`)
+
+A configuration is identified by its **file name without `.json`** (e.g. `Configurations/project1.json` is `project1`). That identifier is what `SwitchConfiguration` and `MCP_CONFIG_NAME` take and what the tools report in `Configuration`. The `name` field inside the JSON is only a display label: it does not have to be unique and is never used to select a configuration.
 
 ### Core Database Operations (6 tools)
 - **ExecuteQuery** - Run SELECT queries within the allowed schemas

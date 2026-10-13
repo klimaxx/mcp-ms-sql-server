@@ -9,18 +9,21 @@ namespace McpMsSqlServer.Tools;
 public static class ConfigurationTools
 {
     [McpServerTool]
-    [Description("List all available project configurations")]
+    [Description("List all available project configurations. 'configurations' holds the identifiers to pass to SwitchConfiguration; 'details' pairs each identifier with its display name")]
     public static string ListConfigurations(ConfigService configService)
     {
         var configs = configService.ListConfigurations();
-        return JsonSerializer.Serialize(new { configurations = configs }, new JsonSerializerOptions { WriteIndented = true });
+        var details = configService.ListConfigurationDetails()
+            .Select(d => new { configuration = d.Configuration, name = d.Name })
+            .ToList();
+        return JsonSerializer.Serialize(new { configurations = configs, details }, new JsonSerializerOptions { WriteIndented = true });
     }
     
     [McpServerTool]
     [Description("Switch to a different project configuration")]
     public static string SwitchConfiguration(
         ConfigService configService,
-        [Description("The name of the configuration to switch to")] string configName)
+        [Description("The configuration identifier (file name without .json, as returned by ListConfigurations); matched case-insensitively")] string configName)
     {
         return configService.SwitchConfiguration(configName);
     }
